@@ -1,54 +1,58 @@
-# Silent Video Title Generator
+# B-Roll Title Generator
 
-An experimental local-first web app that turns a short, silent video into social video title ideas. It analyses what is visible, finds relevant examples from an optional title corpus, and generates titles that fit the clip and the app's style guidance.
+An experimental local-first app for creating burn-in title ideas for social media short-form videos. Upload a B-roll clip, such as footage from an Instagram creator, and the app analyses its visuals, finds similar reel examples, and suggests on-screen title text that fits the footage.
 
-The app uses **Anthropic** for video analysis and title generation, **OpenAI** for text embeddings and similarity search, and **SQLite** for local data. It does not need a Supabase account or a hosted database.
+The app uses **Anthropic** to understand video frames and generate titles, **OpenAI** to create text embeddings, and **SQLite** to store the reel reference table, uploads, generations, and feedback locally.
 
 ## What it does
 
-- Accepts MP4 and MOV videos, with a 50 MB upload limit and a 60 second processing limit.
-- Produces ten title candidates and displays the five highest ranked.
-- Uses an optional corpus of example titles and video descriptions to guide generation.
-- Saves uploads, generation history, and title feedback on the machine running the app.
+- Takes an MP4 or MOV B-roll clip and samples its frames to understand the scene, subject, setting, mood, and visual hook.
+- Matches that visual description to popular and other relevant reel examples in a local table. The table stores extracted burned-in titles, visual descriptions, hook types, and available performance signals.
+- Uses the matched examples as context for generating ten title candidates, then ranks them and presents the top five for review.
+- Lets you steer the ideas and give feedback on titles. Saved likes can inform later generations on the same local app.
+- Keeps the original video as reference footage. It suggests title text; it does not render the text onto the video.
+
+Clips must be MP4 or MOV, no larger than 50 MB, and no longer than 60 seconds.
 
 ## How the pipeline works
 
 ```mermaid
-flowchart LR
-  A[Upload video] --> B[Local disk]
-  B --> C[FFmpeg checks clip and samples frames]
-  C --> D[Anthropic describes the video]
-  D --> E[OpenAI embeds the description]
-  E --> F[SQLite searches corpus and liked examples]
-  F --> G[Anthropic generates 10 titles]
-  G --> H[OpenAI ranks titles when corpus exists]
-  H --> I[SQLite saves results and feedback]
+flowchart TD
+  clip["Upload B-roll clip"] --> frames["FFmpeg checks the clip<br/>and samples up to 8 frames"]
+  frames --> vision["Anthropic describes<br/>the visual content"]
+  vision --> query["OpenAI embeds<br/>the visual description"]
+
+  csv["Reel CSV<br/>burned-in titles + descriptions"] --> importer["Import and embed examples"]
+  importer --> table[("SQLite reel reference table")]
+  table --> search["Find visually similar reels<br/>and varied title examples"]
+  query --> search
+
+  search --> generate["Anthropic generates<br/>10 burn-in title ideas"]
+  generate --> rank["OpenAI embeddings rank ideas<br/>against reel performance examples"]
+  search --> rank
+  rank --> results["Show the top 5 titles"]
+  results --> saved[("SQLite saves history<br/>and title feedback")]
 ```
 
-1. The browser prepares and uploads the clip to the app server. The server stores it locally and records a generation attempt.
-2. FFmpeg checks that the clip contains video, enforces the 60 second duration limit, and extracts up to eight frames.
-3. Anthropic analyzes the sampled frames and returns a structured description: scene, subject, setting, vibe, and visual hook.
-4. OpenAI embeds the scene and visual hook. SQLite compares that vector with the description vectors in the imported corpus. The app selects relevant, varied examples and may add titles the user previously liked.
-5. Anthropic generates ten candidates using the description, examples, style guidance, and any steering entered in the app.
-6. When a corpus is available, OpenAI embeds the candidates so the app can rank them against the corpus. The app saves the result and feedback to SQLite, then displays the top five.
+The CSV import builds the reference table that gives generations reel examples to draw from. This is retrieval, not model training or fine-tuning: during import, the script classifies title hook types and creates OpenAI embeddings for reel titles and visual descriptions. During generation, the app embeds the new clip's description, compares it locally with the stored reel descriptions, and uses relevant examples to guide Anthropic. Without importing the CSV, title generation still works, but it has no reel examples for retrieval or corpus-based ranking.
 
 ## Architecture
 
-- `app/` — Next.js App Router pages and API routes, including upload, generation, history, and feedback endpoints.
-- `components/` — reusable interface components and the upload, history, and title views.
-- `lib/generation/` — coordinates media inspection, vision, retrieval, title generation, and ranking.
-- `lib/media/` — video preparation, temporary files, FFmpeg frame extraction, and clip inspection.
-- `lib/providers/` — Anthropic vision and generation clients, plus OpenAI embedding client.
-- `lib/db/` — creates and accesses the local SQLite database; vector similarity is calculated locally.
-- `lib/retrieval/` — corpus search, diversity reranking, title scoring, and liked-title retrieval.
-- `scripts/` — dataset import, collection, and evaluation utilities.
-- `datasets/` — the optional example corpus and its format notes.
+- `app/` — Next.js pages and API routes for uploads, generation, history, and feedback.
+- `components/` — upload, clip preview, history, and title review interface.
+- `lib/media/` — upload preparation, FFmpeg probing, temporary files, and frame extraction.
+- `lib/generation/` — coordinates visual analysis, embedding search, title generation, and ranking.
+- `lib/providers/` — Anthropic vision and generation clients, plus OpenAI embeddings.
+- `lib/db/` — initializes SQLite tables and performs local embedding similarity search.
+- `lib/retrieval/` — searches reel examples, diversifies results, calculates title priors, and retrieves liked titles.
+- `scripts/import-dataset.ts` — classifies and imports the reel CSV into SQLite.
+- `datasets/` — the example reel CSV and instructions for its fields.
 
-By default, SQLite is stored at `data/app.sqlite` and uploaded videos at `data/uploads/`. Both are ignored by Git. Set `DATA_DIR` to store them in another persistent directory.
+SQLite lives at `data/app.sqlite`; uploaded clips live in `data/uploads/`. Both are ignored by Git. Set `DATA_DIR` to put them in another persistent directory.
 
 ## Try it locally
 
-You need Node.js 22.13 or newer, npm, and API keys for both Anthropic and OpenAI. Provider usage may incur charges on your accounts.
+Requirements: Node.js 22.13 or newer, npm, and API keys for Anthropic and OpenAI. Provider API usage may incur charges.
 
 ```bash
 git clone <your-public-repository-url>
@@ -57,7 +61,7 @@ npm install
 cp .env.example .env.local
 ```
 
-Open `.env.local` and add your keys and a private cookie secret:
+Add your keys and a private cookie secret to `.env.local`:
 
 ```env
 ANTHROPIC_API_KEY=your-anthropic-api-key
@@ -66,35 +70,35 @@ COOKIE_SECRET=your-random-secret
 # DATA_DIR=./data
 ```
 
-Generate a random cookie secret in the terminal:
+Generate a random cookie secret:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-Then start the app:
+### Import the reel examples
 
-```bash
-npm run dev
-```
-
-Open <http://localhost:3000>, find the **Try the demo** section, and click **Enter**. Then upload a clip. The SQLite database is initialized automatically. The app can generate titles without an imported corpus, but corpus-based examples and ranking will be unavailable.
-
-### Optional: import the example corpus
-
-The repository includes `datasets/william-wade-titles.csv`. To classify its titles, create embeddings, and replace the local corpus, run:
+Import the included CSV to populate the SQLite reel reference table and enable example-based retrieval:
 
 ```bash
 npm run import:dataset -- --apply
 ```
 
-This uses both provider APIs and may incur charges. The import replaces all rows in the local corpus table; it does not import videos or alter generation history. You can also edit `datasets/william-wade-titles.csv` to use a dataset you have permission to use.
+This uses both provider APIs to classify titles and create embeddings, and may incur charges. The import replaces the rows in the local corpus table; it does not import video files or change generation history. To use a different reel dataset, replace `datasets/william-wade-titles.csv` with a CSV in the documented format.
+
+### Start the app
+
+```bash
+npm run dev
+```
+
+Open <http://localhost:3000>, go to **Try the demo**, click **Enter**, and upload a B-roll clip.
 
 ## Data and privacy
 
-Video files and app records stay on the machine running the app. During generation, sampled video frames are sent to Anthropic for visual analysis. The resulting text descriptions, corpus text, and generated titles are sent to OpenAI for embeddings; raw video frames are not sent to OpenAI by this pipeline. Check the providers' current API terms and privacy settings before using the app with sensitive material.
+Uploaded video files and app records stay on the machine running the app. Sampled video frames are sent to Anthropic for visual analysis. Text descriptions, reel text, and title candidates are sent to OpenAI for embeddings; raw frames are not sent to OpenAI by this pipeline. Review the providers' current API terms and privacy settings before processing sensitive footage.
 
-Keep `.env.local` and the `data/` directory private. Do not commit API keys, personal videos, or user data. The local disk setup is intended for local use or a server with persistent storage; serverless deployments with ephemeral filesystems will not reliably retain the database or videos. Do not expose a shared public instance with your own API keys unless you add suitable authentication, quotas, and abuse protections.
+Keep `.env.local` and `data/` private. Do not commit API keys, personal videos, or user data. The app is designed for local use or a server with persistent disk. Serverless hosts with temporary filesystems will not reliably retain the database or uploads. Add authentication, quotas, and abuse protections before exposing a shared deployment that uses your API keys.
 
 ## Development
 
@@ -104,9 +108,3 @@ npm run typecheck  # Check TypeScript types
 npm test           # Run the Vitest suite
 npm run build      # Create a production build
 ```
-
-## License and dataset
-
-There is currently no `LICENSE` file in this repository. A public GitHub repository can be viewed and forked, but a license is needed to clearly grant broader permission to use, modify, and redistribute the project. Choose and add a license before presenting the project as open source. [GitHub's licensing guide](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository) explains the options.
-
-The example CSV contains creator-post metadata and descriptions. Confirm you have the necessary rights and permissions before redistributing the dataset or derived data.

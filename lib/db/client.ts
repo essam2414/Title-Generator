@@ -30,7 +30,7 @@ export function db(): DatabaseSync {
     );
     CREATE TABLE IF NOT EXISTS corpus_titles (
       id TEXT PRIMARY KEY, niche_id TEXT NOT NULL REFERENCES niches(id), title TEXT NOT NULL,
-      hook_family TEXT NOT NULL, performance_score REAL, view_outlier_score REAL,
+      hook_family TEXT NOT NULL, performance_score REAL, share_rate_estimate REAL, view_outlier_score REAL,
       creator_handle TEXT, visual_description TEXT, title_template TEXT, source_url TEXT,
       source_platform TEXT, embedding TEXT, description_embedding TEXT,
       scraped_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -70,6 +70,13 @@ export function db(): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS liked_creator_idx ON liked_titles(creator_handle, created_at DESC);
   `);
+  // Evolve existing local databases as well as creating fresh ones. The CSV
+  // importer writes share_rate_estimate, which was added after the first local
+  // schema version had already been created by some users.
+  const corpusColumns = database.prepare('PRAGMA table_info(corpus_titles)').all() as Array<{ name: string }>;
+  if (!corpusColumns.some((column) => column.name === 'share_rate_estimate')) {
+    database.exec('ALTER TABLE corpus_titles ADD COLUMN share_rate_estimate REAL');
+  }
   database.prepare(`INSERT OR IGNORE INTO niches(id, display_name, style_brief)
     VALUES (?, ?, ?)`)
     .run('luxury-menswear', 'Luxury Menswear', 'Create short, natural social video titles for luxury menswear. Keep the tone confident, understated, and specific to what is visible.');
