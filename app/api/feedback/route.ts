@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db/client';
+import { db, json } from '@/lib/db/client';
 import { embed } from '@/lib/providers/openai/embedding';
 import { prunableIds, LIKED_CAP_PER_CREATOR } from '@/lib/feedback/rules';
 import { displayTitles } from '@/lib/generation/constants';
@@ -24,46 +24,34 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'vote must be -1 or 1' }, { status: 400 });
   }
 
-  const up = await db()
-    .from('title_feedback')
-    .upsert(
-      { generation_id: body.generation_id, title_index: body.title_index, vote: body.vote },
-      { onConflict: 'generation_id,title_index' },
-    );
-  if (up.error) return NextResponse.json({ error: up.error.message }, { status: 500 });
+  const database = db();
+  database.prepare(`INSERT INTO title_feedback(generation_id,title_index,vote) VALUES(?,?,?)
+    ON CONFLICT(generation_id,title_index) DO UPDATE SET vote=excluded.vote,created_at=datetime('now')`)
+    .run(body.generation_id, body.title_index, body.vote);
 
   if (body.vote === 1) {
     // Best-effort. A like that fails to index is a missed voice signal, not a
     // lost vote: the ledger row above already stands, and a thumbs-up must not
-    // surface an error. But every step's `.error` IS checked and thrown here —
-    // supabase-js returns errors rather than throwing them, so skipping that
-    // check would let a failed write pass through silently, with the catch
-    // below never firing and nothing logged anywhere.
+    // If indexing a liked title fails, keep the saved feedback vote and log the issue.
     try {
-      const gen = await db()
-        .from('generations')
-        .select('vision_description, generated_titles, generation_attempts(creator_handle, niche_id)')
-        .eq('id', body.generation_id)
-        .single();
-      if (gen.error || !gen.data) throw new Error(gen.error?.message ?? 'generation not found');
-
-      const attempt = gen.data.generation_attempts as unknown as {
-        creator_handle: string | null;
-        niche_id: string;
-      };
+      const gen = database.prepare(`SELECT g.vision_description,g.generated_titles,a.creator_handle,a.niche_id
+        FROM generations g JOIN generation_attempts a ON a.id=g.id WHERE g.id=?`).get(body.generation_id) as
+        Record<string, unknown> | undefined;
+      if (!gen) throw new Error('generation not found');
+      const attempt = { creator_handle: gen.creator_handle as string | null, niche_id: String(gen.niche_id) };
       // The client only ever saw displayTitles(...) — sorted and sliced to 5 —
       // so title_index is an index into THAT list, not the raw 10-wide stored
       // array. Rows written before the ranking change landed are stored in
       // model-emission order, where the two orders diverge.
       const titles = displayTitles(
-        gen.data.generated_titles as Array<{
+        json(gen.generated_titles, [] as Array<{
           text: string;
           hookFamily: string;
           templateSimilarityPrior: number;
-        }>,
+        }>),
       );
       const picked = titles[body.title_index];
-      const vision = gen.data.vision_description as { scene: string; visualHook: string };
+      const vision = json(gen.vision_description, { scene: '', visualHook: '' });
       if (!picked || !attempt?.creator_handle) throw new Error('missing title or creator_handle');
 
       // MUST match lib/generation/orchestrator.ts byte for byte, or these
@@ -71,30 +59,20 @@ export async function POST(req: NextRequest) {
       const text = `${vision.scene} ${vision.visualHook}`.slice(0, 8000);
       const { vector } = await embed(text);
 
-      const likedUp = await db().from('liked_titles').upsert(
-        {
-          generation_id: body.generation_id,
-          title_index: body.title_index,
-          creator_handle: attempt.creator_handle,
-          niche_id: attempt.niche_id,
-          title: picked.text,
-          hook_family: picked.hookFamily,
-          visual_description: text,
-          description_embedding: vector as unknown as string,
-        },
-        { onConflict: 'generation_id,title_index' },
-      );
-      if (likedUp.error) throw new Error(likedUp.error.message);
+      database.prepare(`INSERT INTO liked_titles(id,generation_id,title_index,creator_handle,niche_id,title,
+        hook_family,visual_description,description_embedding) VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(generation_id,title_index) DO UPDATE SET creator_handle=excluded.creator_handle,
+        niche_id=excluded.niche_id,title=excluded.title,hook_family=excluded.hook_family,
+        visual_description=excluded.visual_description,description_embedding=excluded.description_embedding,
+        created_at=datetime('now')`).run(crypto.randomUUID(), body.generation_id, body.title_index,
+        attempt.creator_handle, attempt.niche_id, picked.text, picked.hookFamily, text, JSON.stringify(vector));
 
-      const existing = await db()
-        .from('liked_titles')
-        .select('id, created_at')
-        .eq('creator_handle', attempt.creator_handle);
-      if (existing.error) throw new Error(existing.error.message);
-      const victims = prunableIds(existing.data ?? [], LIKED_CAP_PER_CREATOR);
-      if (victims.length > 0) {
-        const del = await db().from('liked_titles').delete().in('id', victims);
-        if (del.error) throw new Error(del.error.message);
+      const existing = database.prepare('SELECT id,created_at FROM liked_titles WHERE creator_handle=? ORDER BY created_at DESC')
+        .all(attempt.creator_handle) as Array<{ id: string; created_at: string }>;
+      const victims = prunableIds(existing, LIKED_CAP_PER_CREATOR);
+      if (victims.length) {
+        const del = database.prepare('DELETE FROM liked_titles WHERE id=?');
+        for (const id of victims) del.run(id);
       }
     } catch (e) {
       console.warn(`feedback: like not indexed: ${(e as Error).message}`);
@@ -105,12 +83,8 @@ export async function POST(req: NextRequest) {
     // creator-approved after the ledger has recorded it as rejected. Same
     // best-effort contract as the like path: this must not error the response.
     try {
-      const del = await db()
-        .from('liked_titles')
-        .delete()
-        .eq('generation_id', body.generation_id)
-        .eq('title_index', body.title_index);
-      if (del.error) throw new Error(del.error.message);
+      database.prepare('DELETE FROM liked_titles WHERE generation_id=? AND title_index=?')
+        .run(body.generation_id, body.title_index);
     } catch (e) {
       console.warn(`feedback: like retraction failed: ${(e as Error).message}`);
     }

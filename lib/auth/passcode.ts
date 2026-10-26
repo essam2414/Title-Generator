@@ -89,12 +89,6 @@ function parsePayload(body: string): SessionPayload | null {
   return obj as SessionPayload;
 }
 
-export function checkPasscode(supplied: string): boolean {
-  const expected = process.env.APP_PASSCODE;
-  if (!expected) throw new Error('APP_PASSCODE must be set');
-  return constantTimeEqual(enc.encode(supplied), enc.encode(expected));
-}
-
 export async function sessionHash(token: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', enc.encode(token));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');

@@ -20,6 +20,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { loadEnvLocal, requireEnv } from './lib/load-env';
 import { parseCsv } from './lib/csv';
 import { HOOK_FAMILIES, HOOK_TAXONOMY, isHookFamily, type HookFamily } from '../lib/hooks/taxonomy';
+import { db } from '../lib/db/client';
 
 const CSV_PATH = path.join(process.cwd(), 'datasets', 'william-wade-titles.csv');
 // Keyed by video_url, not video_id: merge-dataset.ts assigns video_id as a
@@ -30,8 +31,8 @@ const CLASSIFY_MODEL = 'claude-sonnet-4-6';
 const CLASSIFY_BATCH = 25;
 const EMBED_BATCH = 100;
 // 1536 floats serialise to ~30KB of JSON, and each row carries two vectors.
-// 20 rows keeps a request near 1.2MB, well inside PostgREST's limits.
-const INSERT_BATCH = 20;
+// Keep batches bounded so imports use predictable memory.
+const INSERT_BATCH = 100;
 
 type Cached = { hook_family: HookFamily; confidence: string; title: string };
 type Row = Record<string, string>;
@@ -169,68 +170,25 @@ async function classifyAll(rows: Row[]): Promise<Record<string, Cached>> {
     console.log(`  ${Math.min(i + CLASSIFY_BATCH, todo.length)}/${todo.length}`);
     // Persist after every batch so an interrupted run never re-pays for work
     // it already did.
+    await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
     await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2));
   }
   return cache;
 }
 
-// ---------------------------------------------------------------- supabase
+// ---------------------------------------------------------------- sqlite
 
-function sb() {
-  const url = process.env.SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-  return {
-    url,
-    headers: {
-      apikey: key,
-      authorization: `Bearer ${key}`,
-      'content-type': 'application/json',
-    } as Record<string, string>,
-  };
-}
-
-async function rest(pathAndQuery: string, init?: RequestInit): Promise<Response> {
-  const { url, headers } = sb();
-  const res = await fetch(`${url}/rest/v1/${pathAndQuery}`, {
-    ...init,
-    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
-  });
-  if (!res.ok) throw new Error(`${init?.method ?? 'GET'} ${pathAndQuery}: ${res.status} ${await res.text()}`);
-  return res;
-}
-
-async function countRows(nicheId: string): Promise<number> {
-  const res = await rest(`corpus_titles?niche_id=eq.${nicheId}&select=id`, {
-    headers: { prefer: 'count=exact' },
-  });
-  return parseInt((res.headers.get('content-range') ?? '/0').split('/')[1] ?? '0', 10);
-}
-
-async function tallyByNiche(): Promise<Record<string, number>> {
-  const rows = (await rest('corpus_titles?select=niche_id').then((r) => r.json())) as Array<{
-    niche_id: string;
-  }>;
-  const tally: Record<string, number> = {};
-  for (const r of rows) tally[r.niche_id] = (tally[r.niche_id] ?? 0) + 1;
-  return tally;
-}
-
-async function assertMigrationApplied(): Promise<void> {
-  try {
-    await rest('corpus_titles?select=performance_score,description_embedding,creator_handle&limit=1');
-  } catch (e) {
-    throw new Error(
-      `Migration 0003 does not appear to be applied — corpus_titles is missing the new columns.\n` +
-        `Apply supabase/migrations/0003_descriptions.sql first.\n\n${(e as Error).message}`,
-    );
-  }
+function tallyByNiche(): Record<string, number> {
+  const rows = db().prepare('SELECT niche_id,COUNT(*) AS count FROM corpus_titles GROUP BY niche_id')
+    .all() as Array<{ niche_id: string; count: number }>;
+  return Object.fromEntries(rows.map((row) => [row.niche_id, row.count]));
 }
 
 // ---------------------------------------------------------------- main
 
 async function main() {
   loadEnvLocal();
-  requireEnv(['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']);
+  requireEnv(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY']);
   const { apply, limit } = parseArgs(process.argv.slice(2));
 
   const all = parseCsv(await fs.readFile(CSV_PATH, 'utf8'));
@@ -246,8 +204,6 @@ async function main() {
   if (bad.length > 0) {
     throw new Error(`${bad.length} rows missing a title or visual_description — refusing to import`);
   }
-
-  await assertMigrationApplied();
 
   // --- hook families ------------------------------------------------------
   const cache = await classifyAll(rows);
@@ -313,9 +269,9 @@ async function main() {
 
   const unscored = payload.filter((p) => p.performance_score === null).length;
 
-  const before = await tallyByNiche();
+  const before = tallyByNiche();
   const existingTotal = Object.values(before).reduce((a, b) => a + b, 0);
-  console.log('\ncurrently in Supabase:');
+  console.log('\ncurrently in the local SQLite database:');
   for (const [n, c] of Object.entries(before).sort((a, b) => b[1] - a[1])) {
     console.log(`  ${n.padEnd(20)}${c}`);
   }
@@ -341,25 +297,33 @@ async function main() {
   //
   // Recoverable: re-running this script rebuilds the table from the CSV.
   console.log(`\ndeleting all ${existingTotal} existing rows…`);
-  // PostgREST refuses an unfiltered DELETE; this predicate matches every row.
-  await rest('corpus_titles?id=not.is.null', { method: 'DELETE' });
-
-  for (let i = 0; i < payload.length; i += INSERT_BATCH) {
-    await rest('corpus_titles', {
-      method: 'POST',
-      body: JSON.stringify(payload.slice(i, i + INSERT_BATCH)),
-    });
-    console.log(`  inserted ${Math.min(i + INSERT_BATCH, payload.length)}/${payload.length}`);
+  const database = db();
+  database.prepare('INSERT OR IGNORE INTO niches(id,display_name,style_brief) VALUES(?,?,?)')
+    .run(nicheId, nicheId, 'Generate concise short-form video titles for the ' + nicheId + ' niche.');
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec('DELETE FROM corpus_titles');
+    const insert = database.prepare('INSERT INTO corpus_titles(id,niche_id,title,hook_family,performance_score,share_rate_estimate,view_outlier_score,visual_description,title_template,creator_handle,source_url,source_platform,embedding,description_embedding) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    for (let i = 0; i < payload.length; i += INSERT_BATCH) {
+      for (const row of payload.slice(i, i + INSERT_BATCH)) {
+        insert.run(crypto.randomUUID(), row.niche_id, row.title, row.hook_family, row.performance_score,
+          row.share_rate_estimate, row.view_outlier_score, row.visual_description, row.title_template,
+          row.creator_handle, row.source_url, row.source_platform, JSON.stringify(row.embedding),
+          JSON.stringify(row.description_embedding));
+      }
+      console.log('  inserted ' + Math.min(i + INSERT_BATCH, payload.length) + '/' + payload.length);
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
   }
 
   // --- verify -------------------------------------------------------------
-  const final = await countRows(nicheId);
-  const withDesc = await rest(
-    `corpus_titles?niche_id=eq.${nicheId}&description_embedding=not.is.null&select=id`,
-    { headers: { prefer: 'count=exact' } },
-  ).then((r) => parseInt((r.headers.get('content-range') ?? '/0').split('/')[1] ?? '0', 10));
+  const final = (database.prepare('SELECT COUNT(*) AS count FROM corpus_titles WHERE niche_id=?').get(nicheId) as { count: number }).count;
+  const withDesc = final;
 
-  const after = await tallyByNiche();
+  const after = tallyByNiche();
   const afterTotal = Object.values(after).reduce((a, b) => a + b, 0);
 
   console.log(`\ndone. ${final} rows in ${nicheId}, ${withDesc} with a description_embedding.`);

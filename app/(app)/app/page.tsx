@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Sparkles, LogOut } from 'lucide-react';
+import Link from 'next/link';
+import { ArrowLeft, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { DashboardGuide } from '@/components/app/dashboard-guide';
@@ -168,11 +169,6 @@ export default function Page() {
     [storagePath, votesByTitle],
   );
 
-  const onLogout = async () => {
-    await fetch('/api/logout', { method: 'POST' });
-    window.location.href = '/login';
-  };
-
   // Page-level keyboard shortcuts. Title-row shortcuts (↑↓ c 1-9) live in TitleList.
   useKeyboard(
     (e) => {
@@ -200,15 +196,16 @@ export default function Page() {
   return (
     <div className="min-h-screen flex flex-col">
       <header className="border-b border-border">
-        <div className="container flex h-14 items-center justify-between">
+        <div className="container flex h-14 items-center gap-4">
+          <Button variant="ghost" size="sm" asChild>
+            <Link href="/">
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </Link>
+          </Button>
           <div className="flex items-baseline gap-3">
             <h1 className="font-display text-xl tracking-tight">Hook Title Generator</h1>
-            <span className="text-micro uppercase tracking-[0.12em] text-ink-muted">w. j. wade</span>
           </div>
-          <Button variant="ghost" size="sm" onClick={onLogout}>
-            <LogOut className="h-4 w-4" />
-            Log out
-          </Button>
         </div>
       </header>
 

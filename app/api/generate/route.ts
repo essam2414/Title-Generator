@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db/client';
-import { BUCKET } from '@/lib/storage/constants';
+import { db, json } from '@/lib/db/client';
+import { uploadFilePath } from '@/lib/storage/upload';
+import { readFile } from 'node:fs/promises';
 import { SESSION_COOKIE, verifySession, sessionHash } from '@/lib/auth/passcode';
 import { runPipeline, PipelineError, type PipelineResult } from '@/lib/generation/orchestrator';
 import { displayTitles } from '@/lib/generation/constants';
@@ -47,104 +48,60 @@ export async function POST(req: NextRequest) {
   const steering = typeof body.steering === 'string' && body.steering.trim().length > 0 ? body.steering : undefined;
 
   // Idempotency: if a generation already exists for this client_request_id, return it.
-  const existing = await db()
-    .from('generations')
-    .select('id, generated_titles, vision_description, retrieved_corpus_ids, cost_usd, duration_ms')
-    .eq('client_request_id', body.client_request_id)
-    .maybeSingle();
-  if (existing.error) {
-    return NextResponse.json({ error: `db: ${existing.error.message}` }, { status: 500 });
-  }
-  if (existing.data) {
+  const database = db();
+  const existing = database.prepare(`SELECT id,generated_titles,vision_description,cost_usd,duration_ms
+    FROM generations WHERE client_request_id=?`).get(body.client_request_id) as Record<string, unknown> | undefined;
+  if (existing) {
     return NextResponse.json({
-      id: existing.data.id,
-      titles: displayTitles(existing.data.generated_titles as PipelineResult['titles']),
-      visionDescription: existing.data.vision_description,
+      id: existing.id,
+      titles: displayTitles(json(existing.generated_titles, [] as PipelineResult['titles'])),
+      visionDescription: json(existing.vision_description, null),
       storagePath: body.storage_path,
-      costUsd: existing.data.cost_usd,
-      durationMs: existing.data.duration_ms,
+      costUsd: existing.cost_usd,
+      durationMs: existing.duration_ms,
       idempotent: true,
     });
   }
 
   // Rate limit on session attempts (success or failure) in last 24h.
-  const since = new Date(Date.now() - 86_400_000).toISOString();
-  const rate = await db()
-    .from('generation_attempts')
-    .select('id', { count: 'exact', head: true })
-    .eq('passcode_session_hash', sessHash)
-    .gte('started_at', since);
-  if (rate.error) {
-    return NextResponse.json({ error: `db: ${rate.error.message}` }, { status: 500 });
-  }
-  if ((rate.count ?? 0) >= RATE_LIMIT_PER_DAY) {
+  const rate = database.prepare(`SELECT COUNT(*) AS count FROM generation_attempts
+    WHERE passcode_session_hash=? AND started_at >= datetime('now','-1 day')`).get(sessHash) as { count: number };
+  if (rate.count >= RATE_LIMIT_PER_DAY) {
     return NextResponse.json({ error: 'rate limit: 20 generations per 24h' }, { status: 429 });
   }
 
   // Look up niche + fingerprint.
-  const niche = await db()
-    .from('niches')
-    .select('id, style_brief')
-    .eq('id', body.niche_id)
-    .maybeSingle();
-  if (niche.error) return NextResponse.json({ error: niche.error.message }, { status: 500 });
-  if (!niche.data) return NextResponse.json({ error: `unknown niche_id: ${body.niche_id}` }, { status: 400 });
+  const niche = database.prepare('SELECT id,style_brief FROM niches WHERE id=?').get(body.niche_id) as
+    { id: string; style_brief: string } | undefined;
+  if (!niche) return NextResponse.json({ error: `unknown niche_id: ${body.niche_id}` }, { status: 400 });
 
   let styleFingerprint: string[] = [];
   if (creatorHandle) {
-    const fp = await db()
-      .from('creator_style_fingerprints')
-      .select('best_titles')
-      .eq('creator_handle', creatorHandle)
-      .maybeSingle();
-    if (fp.error) return NextResponse.json({ error: fp.error.message }, { status: 500 });
-    if (fp.data) styleFingerprint = fp.data.best_titles ?? [];
+    const fp = database.prepare('SELECT best_titles FROM creator_style_fingerprints WHERE creator_handle=?')
+      .get(creatorHandle) as { best_titles: string } | undefined;
+    if (fp) styleFingerprint = json(fp.best_titles, [] as string[]);
   }
 
   // Log the attempt BEFORE doing real work. Generations row only on success.
-  const attempt = await db()
-    .from('generation_attempts')
-    .insert({
-      client_request_id: body.client_request_id,
-      storage_path: body.storage_path,
-      niche_id: body.niche_id,
-      vision_provider: visionProvider,
-      generation_provider: generationProvider,
-      passcode_session_hash: sessHash,
-      // Narrowed local, not the raw body: the pipeline call below retrieves
-      // and attributes with this same value, so a non-string client payload
-      // must not let the attempt row and the pipeline disagree on the key
-      // this feature partitions by.
-      creator_handle: creatorHandle,
-    })
-    .select('id')
-    .single();
-  if (attempt.error) {
-    return NextResponse.json({ error: `attempt: ${attempt.error.message}` }, { status: 500 });
+  const attemptId = crypto.randomUUID();
+  database.prepare(`INSERT INTO generation_attempts
+    (id,client_request_id,storage_path,niche_id,vision_provider,generation_provider,passcode_session_hash,creator_handle)
+    VALUES (?,?,?,?,?,?,?,?)`).run(attemptId, body.client_request_id, body.storage_path, body.niche_id,
+    visionProvider, generationProvider, sessHash, creatorHandle);
+  let videoBytes: Buffer;
+  try {
+    videoBytes = await readFile(uploadFilePath(body.storage_path));
+  } catch {
+    await markFailure(attemptId, 'persist', 'uploaded video not found');
+    return NextResponse.json({ error: 'Uploaded video not found. Please upload it again.' }, { status: 400 });
   }
-  const attemptId: string = attempt.data.id;
-
-  // Download from Storage via direct REST (SDK's .download() is flaky on Node 20).
-  const dlUrl = `${process.env.SUPABASE_URL}/storage/v1/object/${BUCKET}/${body.storage_path}`;
-  const dlRes = await fetch(dlUrl, {
-    headers: {
-      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? '',
-      authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''}`,
-    },
-  });
-  if (!dlRes.ok) {
-    const txt = await dlRes.text().catch(() => '');
-    await markFailure(attemptId, 'persist', `download ${dlRes.status}: ${txt.slice(0, 200)}`);
-    return NextResponse.json({ error: `storage download ${dlRes.status}` }, { status: 400 });
-  }
-  const videoBytes = Buffer.from(await dlRes.arrayBuffer());
 
   let result: PipelineResult;
   try {
     result = await runPipeline({
       videoBytes,
-      nicheId: niche.data.id,
-      styleBrief: niche.data.style_brief,
+      nicheId: niche.id,
+      styleBrief: niche.style_brief,
       styleFingerprint,
       visionProviderId: visionProvider,
       generationProviderId: generationProvider,
@@ -159,21 +116,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: `${stage}: ${err.message}` }, { status: 500 });
   }
 
-  const ins = await db().from('generations').insert({
-    id: attemptId,
-    client_request_id: body.client_request_id,
-    vision_description: result.visionDescription,
-    retrieved_corpus_ids: result.retrievedCorpusIds,
-    generated_titles: result.titles,
-    cost_usd: result.costUsd,
-    tokens_in: result.tokensIn,
-    tokens_out: result.tokensOut,
-    duration_ms: result.durationMs,
-  });
-  if (ins.error) {
-    await markFailure(attemptId, 'persist', ins.error.message);
-    return NextResponse.json({ error: `persist: ${ins.error.message}` }, { status: 500 });
-  }
+  database.prepare(`INSERT INTO generations
+    (id,client_request_id,vision_description,retrieved_corpus_ids,generated_titles,cost_usd,tokens_in,tokens_out,duration_ms)
+    VALUES (?,?,?,?,?,?,?,?,?)`).run(attemptId, body.client_request_id, JSON.stringify(result.visionDescription),
+    JSON.stringify(result.retrievedCorpusIds), JSON.stringify(result.titles), result.costUsd,
+    result.tokensIn, result.tokensOut, result.durationMs);
 
   return NextResponse.json({
     id: attemptId,
@@ -186,8 +133,6 @@ export async function POST(req: NextRequest) {
 }
 
 async function markFailure(attemptId: string, stage: string, message: string): Promise<void> {
-  await db()
-    .from('generation_attempts')
-    .update({ failed_at: new Date().toISOString(), failure_stage: stage, failure_message: message.slice(0, 2000) })
-    .eq('id', attemptId);
+  db().prepare(`UPDATE generation_attempts SET failed_at=?,failure_stage=?,failure_message=? WHERE id=?`)
+    .run(new Date().toISOString(), stage, message.slice(0, 2000), attemptId);
 }
