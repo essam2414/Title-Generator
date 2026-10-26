@@ -25,6 +25,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: problem }, { status: body.size > MAX_BYTES ? 413 : 400 });
   }
 
-  const signed = await createSignedUpload(body.mime);
-  return NextResponse.json(signed);
+  try {
+    const signed = createSignedUpload(body.mime);
+    return NextResponse.json(signed);
+  } catch (error) {
+    return NextResponse.json({ error: (error as Error).message }, { status: 500 });
+  }
 }

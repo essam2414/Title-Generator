@@ -24,11 +24,11 @@ as $$
     c.hook_family,
     c.save_rate_estimate,
     c.embedding,
-    (1 - (c.embedding <=> p_query_embed))::real as similarity
+    (1 - (c.embedding OPERATOR(extensions.<=>) p_query_embed))::real as similarity
   from corpus_titles c
   where c.niche_id = p_niche_id
     and c.embedding is not null
-  order by c.embedding <=> p_query_embed
+  order by c.embedding OPERATOR(extensions.<=>) p_query_embed
   limit p_match_limit;
 $$;
 

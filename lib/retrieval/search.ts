@@ -1,5 +1,5 @@
 import 'server-only';
-import { db } from '@/lib/db/client';
+import { retrieveCorpus } from '@/lib/db/client';
 import type { CorpusTitle } from '@/lib/providers/types';
 import { isHookFamily } from '@/lib/hooks/taxonomy';
 import { mmrRerank, type MmrCandidate } from './mmr';
@@ -30,22 +30,10 @@ export async function retrieveAndRerank(
   nicheId: string,
   queryEmbedding: number[],
 ): Promise<RetrievalResult> {
-  const rpc = await db().rpc('match_corpus_titles', {
-    p_niche_id: nicheId,
-    p_query_embed: queryEmbedding as unknown as string, // pgvector accepts JSON array
-    p_match_limit: RPC_LIMIT,
-  });
-  if (rpc.error) throw new Error(`retrieve: ${rpc.error.message}`);
-  const rows = (rpc.data ?? []) as Array<RetrievedRow & { embedding: number[] | string }>;
+  const rows = retrieveCorpus(nicheId, queryEmbedding, RPC_LIMIT) as RetrievedRow[];
   if (rows.length === 0) return { examples: [], neighbors: [] };
 
-  // pgvector may return embeddings as a string like "[0.1,0.2,...]" via PostgREST.
-  const normalized = rows.map((r): RetrievedRow => ({
-    ...r,
-    embedding: typeof r.embedding === 'string' ? JSON.parse(r.embedding) : r.embedding,
-  }));
-
-  const candidates: MmrCandidate<RetrievedRow>[] = normalized.map((r) => ({
+  const candidates: MmrCandidate<RetrievedRow>[] = rows.map((r) => ({
     item: r,
     relevance: r.similarity,
     embedding: r.embedding,

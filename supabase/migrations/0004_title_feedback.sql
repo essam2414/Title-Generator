@@ -63,10 +63,10 @@ as $$
     l.title,
     l.hook_family,
     l.visual_description,
-    (1 - (l.description_embedding <=> p_query_embed))::real as similarity
+    (1 - (l.description_embedding OPERATOR(extensions.<=>) p_query_embed))::real as similarity
   from liked_titles l
   where l.creator_handle = p_creator_handle
-  order by l.description_embedding <=> p_query_embed
+  order by l.description_embedding OPERATOR(extensions.<=>) p_query_embed
   limit p_match_limit;
 $$;
 

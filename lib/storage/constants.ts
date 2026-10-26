@@ -1,4 +1,3 @@
-export const BUCKET = 'uploads';
 export const MAX_BYTES = 50 * 1024 * 1024;
 
 export const ACCEPTED_MIME = {
@@ -21,10 +20,8 @@ export function formatMb(bytes: number): string {
 // rejection has to read identically to a user whether it is caught in the
 // browser or returned by /api/upload-url, which is callable directly.
 //
-// MAX_BYTES mirrors the `uploads` bucket's own file_size_limit (52428800).
-// Raising it here alone would not raise the ceiling — it would move a clean
-// client-side rejection into a mid-upload storage failure.
-//
+// The server enforces this limit before writing a video to local storage.
+
 // The guidance matters as much as the number. The app also caps duration at
 // 60s, but phone footage at 4K/60 runs ~48 Mbps, so 50 MB is reached in about
 // 8 seconds — the size limit binds roughly 7x sooner than the duration limit,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db/client';
+import { db, json } from '@/lib/db/client';
 import { SESSION_COOKIE, verifySession } from '@/lib/auth/passcode';
 import { displayTitles } from '@/lib/generation/constants';
 import type { GeneratedTitle } from '@/lib/providers/types';
@@ -12,23 +12,17 @@ export async function GET(req: NextRequest) {
 
   // Join generations with their original attempts to get the storage_path.
   // generations.id is intentionally shared with generation_attempts.id.
-  const r = await db()
-    .from('generations')
-    .select(
-      'id, created_at, generated_titles, vision_description, generation_attempts!inner(storage_path)',
-    )
-    .order('created_at', { ascending: false })
-    .limit(12);
-  if (r.error) return NextResponse.json({ error: r.error.message }, { status: 500 });
+  const rows = db().prepare(`SELECT g.id,g.completed_at,g.generated_titles,g.vision_description,a.storage_path
+    FROM generations g JOIN generation_attempts a ON a.id=g.id ORDER BY g.completed_at DESC LIMIT 12`)
+    .all() as Array<Record<string, unknown>>;
 
-  const items = (r.data ?? []).map((row) => {
-    const titles = (row.generated_titles as GeneratedTitle[]) ?? [];
-    const vision = (row.vision_description as { scene?: string } | null) ?? null;
-    const attempt = row.generation_attempts as unknown as { storage_path: string } | null;
+  const items = rows.map((row) => {
+    const titles = json<GeneratedTitle[]>(row.generated_titles, []);
+    const vision = json<{ scene?: string } | null>(row.vision_description, null);
     return {
-      id: row.id as string,
-      createdAt: row.created_at as string,
-      storagePath: attempt?.storage_path ?? '',
+      id: String(row.id),
+      createdAt: String(row.completed_at),
+      storagePath: String(row.storage_path ?? ''),
       // Sorted, not raw index 0: rows written before the ranking change are in
       // model-emission order, where titles[0] means "first emitted", not "best".
       topTitle: displayTitles(titles)[0]?.text ?? '',

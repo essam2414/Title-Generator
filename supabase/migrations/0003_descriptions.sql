@@ -109,12 +109,12 @@ as $$
     -- TITLE-space vector, deliberately: consumed by mmrRerank and
     -- computeTitlePrior, neither of which wants description similarity.
     c.embedding,
-    (1 - (c.description_embedding <=> p_query_embed))::real as similarity
+    (1 - (c.description_embedding OPERATOR(extensions.<=>) p_query_embed))::real as similarity
   from corpus_titles c
   where c.niche_id = p_niche_id
     and c.description_embedding is not null
     and c.embedding is not null
-  order by c.description_embedding <=> p_query_embed
+  order by c.description_embedding OPERATOR(extensions.<=>) p_query_embed
   limit p_match_limit;
 $$;
 
