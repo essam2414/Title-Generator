@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { ArrowLeft, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -11,9 +12,6 @@ import { VideoPanel, VisionSummary } from '@/components/app/video-panel';
 import { ProcessingPanel } from '@/components/app/processing';
 import { TitleList, type TitleListHandle } from '@/components/app/title-list';
 import { HistoryRail } from '@/components/app/history-rail';
-import { HistoryModal } from '@/components/app/history-modal';
-import { RegenerateMenu } from '@/components/app/regenerate-menu';
-import { ShortcutsHelp } from '@/components/app/shortcuts-help';
 import type { GenerateResponse } from '@/components/app/types';
 import { toast } from '@/components/ui/toaster';
 import { useKeyboard } from '@/lib/hooks/use-keyboard';
@@ -22,6 +20,12 @@ import { useKeyboard } from '@/lib/hooks/use-keyboard';
 // accepts either, so this constant is the single place to change if the choice
 // ever comes back.
 const PROVIDER = 'anthropic';
+
+// These controls are only used after the dashboard is already active. Keep
+// their heavier dialog/menu code out of the initial dashboard bundle.
+const HistoryModal = dynamic(() => import('@/components/app/history-modal').then((m) => m.HistoryModal));
+const RegenerateMenu = dynamic(() => import('@/components/app/regenerate-menu').then((m) => m.RegenerateMenu));
+const ShortcutsHelp = dynamic(() => import('@/components/app/shortcuts-help').then((m) => m.ShortcutsHelp));
 
 export default function Page() {
   const [busy, setBusy] = useState<null | 'upload' | 'generate'>(null);
@@ -341,8 +345,8 @@ export default function Page() {
         <HistoryRail onSelect={setHistoryId} refreshKey={historyKey} />
       </main>
 
-      <HistoryModal generationId={historyId} onClose={() => setHistoryId(null)} />
-      <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+      {historyId && <HistoryModal generationId={historyId} onClose={() => setHistoryId(null)} />}
+      {helpOpen && <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
